@@ -31,8 +31,21 @@ export const MAX_HOLD_TTL_MS = 10 * 60 * 1000;
 /** Ceiling on how far into the future repeated extensions can push a hold. */
 export const MAX_HOLD_LIFETIME_MS = 30 * 60 * 1000;
 
-/** Anti-scalping limit: one hold cannot lock more seats than this. */
+/** A single request cannot lock more seats than this. */
 export const MAX_SEATS_PER_HOLD = 8;
+
+/**
+ * The real anti-scalping limit: total seats one user may hold at once, per event.
+ *
+ * MAX_SEATS_PER_HOLD alone is not enough — it caps a single request, so a user could
+ * simply send more of them. Twenty-five requests of eight seats will lock a 200-seat
+ * venue, indefinitely, for free. This is the cap that prevents that.
+ *
+ * Scoped per event: holding seats for one show should not block you from another.
+ * Confirmed bookings do not count — once you have paid, the seats are yours and this
+ * limit is about the basket, not the purchase.
+ */
+export const MAX_ACTIVE_SEATS_PER_USER = 8;
 
 export const createEvent = ({ id, name, venue, startsAt }) => ({
   id,

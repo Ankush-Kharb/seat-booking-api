@@ -22,6 +22,7 @@ import {
   MAX_HOLD_TTL_MS,
   MAX_HOLD_LIFETIME_MS,
   MAX_SEATS_PER_HOLD,
+  MAX_ACTIVE_SEATS_PER_USER,
 } from "../models/index.js";
 
 import { badRequest, notFound, forbidden, conflict, gone } from "../errors/app-error.js";
@@ -65,6 +66,26 @@ const freeSeatsOf = (hold) => {
     if (seat === undefined) continue;
     if (seat.holdId === hold.id) seatRepo.setHold(seat, null);
   }
+};
+
+/**
+ * How many seats this user currently holds for one event.
+ *
+ * Only genuinely live holds count. A user whose hold lapsed, or who released it, gets
+ * that allowance straight back — otherwise a browsing customer would lock themselves
+ * out for half an hour after abandoning a basket.
+ *
+ * Reads through the per-user index, so this costs O(that user's holds), not O(every
+ * active hold in the system).
+ */
+const heldSeatCount = (userId, eventId, now) => {
+  let count = 0;
+  for (const hold of holdRepo.findActiveByUser(userId)) {
+    if (hold.eventId !== eventId) continue;
+    if (!isHoldActive(hold, now)) continue;
+    count += hold.seatIds.length;
+  }
+  return count;
 };
 
 /** Resolve a seat's live status, skipping the hold lookup when there is no hold. */
@@ -111,6 +132,26 @@ export const holdSeats = ({ eventId, seatIds, userId, ttlMs }, now) => {
       code: "SEAT_EVENT_MISMATCH",
       details: { seatIds: foreignSeatIds },
     });
+  }
+
+  // --- the per-user cap ---------------------------------------------------
+  //
+  // MAX_SEATS_PER_HOLD caps one request; on its own it stops nothing, because a
+  // client can just send more requests. Twenty-five requests of eight seats will
+  // lock a 200-seat venue. This is the check that actually prevents it.
+  const alreadyHeld = heldSeatCount(cleanUserId, cleanEventId, now);
+  if (alreadyHeld + cleanSeatIds.length > MAX_ACTIVE_SEATS_PER_USER) {
+    throw conflict(
+      `You may hold at most ${MAX_ACTIVE_SEATS_PER_USER} seats at once for this event`,
+      {
+        code: "USER_HOLD_LIMIT_EXCEEDED",
+        details: {
+          limit: MAX_ACTIVE_SEATS_PER_USER,
+          alreadyHeld,
+          requested: cleanSeatIds.length,
+        },
+      },
+    );
   }
 
   // --- check phase: decide, mutate nothing -------------------------------

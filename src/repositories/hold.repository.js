@@ -7,6 +7,11 @@ export const findById = (holdId) => db.holds.get(holdId);
 export const insert = (hold) => {
   db.holds.set(hold.id, hold);
   db.activeHoldIds.add(hold.id);
+
+  const forUser = db.activeHoldIdsByUser.get(hold.userId);
+  if (forUser === undefined) db.activeHoldIdsByUser.set(hold.userId, new Set([hold.id]));
+  else forUser.add(hold.id);
+
   return hold;
 };
 
@@ -18,7 +23,16 @@ export const insert = (hold) => {
  */
 export const setStatus = (hold, status) => {
   hold.status = status;
-  if (status !== HOLD_STATUS.ACTIVE) db.activeHoldIds.delete(hold.id);
+  if (status === HOLD_STATUS.ACTIVE) return;
+
+  db.activeHoldIds.delete(hold.id);
+
+  const forUser = db.activeHoldIdsByUser.get(hold.userId);
+  if (forUser !== undefined) {
+    forUser.delete(hold.id);
+    // Drop the empty Set rather than leaving one per user who ever held a seat.
+    if (forUser.size === 0) db.activeHoldIdsByUser.delete(hold.userId);
+  }
 };
 
 export const setExpiry = (hold, expiresAt) => {
@@ -34,3 +48,13 @@ export const setExpiry = (hold, expiresAt) => {
  */
 export const findActive = () =>
   Array.from(db.activeHoldIds, (holdId) => db.holds.get(holdId));
+
+/**
+ * Every hold still marked ACTIVE for one user. As with findActive, some may already
+ * be past their expiry — the caller decides what counts.
+ */
+export const findActiveByUser = (userId) => {
+  const holdIds = db.activeHoldIdsByUser.get(userId);
+  if (holdIds === undefined) return [];
+  return Array.from(holdIds, (holdId) => db.holds.get(holdId));
+};

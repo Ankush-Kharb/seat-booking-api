@@ -18,8 +18,12 @@
  *                     of every event to find the ones it wants.
  *   bookingIdByHold — makes confirm idempotent in O(1): "has this hold already
  *                     produced a booking?"
- *   activeHoldIds   — the expiry sweeper walks only live holds instead of every
+  *   activeHoldIds   — the expiry sweeper walks only live holds instead of every
  *                     hold ever created, which otherwise grows without bound.
+ *   activeHoldIdsByUser
+ *                   — enforcing the per-user seat cap would otherwise mean scanning
+ *                     every active hold in the system on every hold request. Under
+ *                     load that is 100,000 holds scanned per request.
  *
  * The cost is that writes must keep the indexes in step with the primary maps.
  * That is exactly why writes are confined to the repositories.
@@ -33,6 +37,7 @@ const emptyState = () => ({
   seatIdsByEvent: new Map(), // eventId -> string[]
   bookingIdByHold: new Map(), // holdId -> bookingId
   activeHoldIds: new Set(),   // holdIds currently ACTIVE (may still be expired)
+  activeHoldIdsByUser: new Map(), // userId -> Set<holdId>, ACTIVE only
 });
 
 export const db = emptyState();

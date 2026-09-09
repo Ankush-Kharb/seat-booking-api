@@ -130,7 +130,7 @@ curl -s -X POST localhost:3000/bookings \
 | `GET` | `/health` | — | liveness |
 | `GET` | `/events` | — | all events |
 | `GET` | `/events/:eventId/seats` | — | seat map + `{available, held, sold}` summary |
-| `POST` | `/holds` | ✓ | `{eventId, seatIds[], ttlMs?}` → 201. All-or-nothing, max 8 seats |
+| `POST` | `/holds` | ✓ | `{eventId, seatIds[], ttlMs?}` → 201. All-or-nothing; max 8 seats per request **and** 8 held per user per event |
 | `POST` | `/holds/:holdId/extend` | ✓ | `{ttlMs?}` → 200. Capped at 30 min total lifetime |
 | `DELETE` | `/holds/:holdId` | ✓ | release early; releasing twice is a no-op |
 | `POST` | `/bookings` | ✓ | `{holdId}` → 201. Idempotent on `holdId` |
@@ -147,7 +147,7 @@ Every error shares one shape, produced by a single middleware:
 | 400 | malformed input, missing `x-user-id` |
 | 403 | the hold or booking belongs to someone else |
 | 404 | unknown event, seat, hold, booking, or route |
-| 409 | seats unavailable, hold already confirmed, lifetime cap reached |
+| 409 | seats unavailable, per-user seat cap reached, hold already confirmed, lifetime cap reached |
 | 410 | the hold expired |
 
 ## Structure
@@ -190,6 +190,37 @@ The ones that earn their keep:
   nastiest bug in the codebase without it.
 - **Confirm is idempotent** — a retried request returns the original booking rather
   than charging twice.
+
+## A bug the load testing found
+
+The first version had `MAX_SEATS_PER_HOLD = 8` and a comment calling it an
+anti-scalping limit. It wasn't one. It caps a single *request*, and nothing stopped a
+user sending more:
+
+```
+scalper made 25 holds of 8 seats each
+seat map: { available: 0, held: 200, sold: 0 }
+real customer: 409 SEATS_UNAVAILABLE — entire venue locked by one user
+```
+
+Twenty-five requests, no payment, whole venue locked — and renewable indefinitely by
+extending before each expiry.
+
+The fix is a second cap on *total seats held per user, per event*, enforced through a
+`userId -> Set<holdId>` index so the check costs O(that user's holds) rather than
+scanning every active hold in the system. Same attack now:
+
+```
+scalper holds made: 1
+blocked with: 409 USER_HOLD_LIMIT_EXCEEDED  {limit: 8, alreadyHeld: 8, requested: 8}
+real customer: held 1 seat — venue is open
+```
+
+The allowance is returned as soon as a hold lapses or is released, so an abandoned
+basket doesn't lock the customer out. Confirmed bookings don't count against it — the
+cap is the basket, not the purchase. Nine tests in
+`tests/booking.service.test.js` cover it, including the original attack as a permanent
+regression test.
 
 ## Measured
 

@@ -7,7 +7,8 @@ import { freshDb, T0, MINUTE } from "./helpers.js";
 import * as service from "../src/services/booking.service.js";
 import { getSeatMap } from "../src/services/event.service.js";
 import * as seatRepo from "../src/repositories/seat.repository.js";
-import { HOLD_STATUS, MAX_HOLD_LIFETIME_MS } from "../src/models/index.js";
+import { HOLD_STATUS, MAX_HOLD_LIFETIME_MS, MAX_ACTIVE_SEATS_PER_USER } from "../src/models/index.js";
+import { seedTestEvent } from "./helpers.js";
 
 let eventId;
 let seatIds;
@@ -103,6 +104,113 @@ describe("holdSeats", () => {
       status: 400,
       code: "BAD_REQUEST",
     });
+  });
+});
+
+describe("per-user seat cap", () => {
+  // Regression suite for a real hole: MAX_SEATS_PER_HOLD caps a single request, so on
+  // its own it stops nothing — a user can send more requests. Before this cap existed,
+  // 25 requests locked a 200-seat venue indefinitely, for free.
+
+  beforeEach(() => {
+    ({ eventId, seatIds } = freshDb({ seatCount: 24, priceCents: 1000 }));
+  });
+
+  test("a user may accumulate seats across several holds, up to the limit", () => {
+    service.holdSeats({ eventId, seatIds: seatIds.slice(0, 5), userId: "alice" }, T0);
+    service.holdSeats({ eventId, seatIds: seatIds.slice(5, 8), userId: "alice" }, T0);
+
+    assert.equal(getSeatMap(eventId, T0).summary.held, MAX_ACTIVE_SEATS_PER_USER);
+  });
+
+  test("the seat after the limit is refused, and nothing is held", () => {
+    service.holdSeats({ eventId, seatIds: seatIds.slice(0, 8), userId: "alice" }, T0);
+
+    assertFails(
+      () => service.holdSeats({ eventId, seatIds: [seatIds[8]], userId: "alice" }, T0),
+      { status: 409, code: "USER_HOLD_LIMIT_EXCEEDED" },
+    );
+    assert.equal(statusOf(seatIds[8], T0), "available");
+  });
+
+  test("the rejection says how far over the caller is", () => {
+    service.holdSeats({ eventId, seatIds: seatIds.slice(0, 6), userId: "alice" }, T0);
+
+    assert.throws(
+      () => service.holdSeats({ eventId, seatIds: seatIds.slice(6, 10), userId: "alice" }, T0),
+      (err) => {
+        assert.deepEqual(err.details, { limit: 8, alreadyHeld: 6, requested: 4 });
+        return true;
+      },
+    );
+  });
+
+  test("one user cannot lock a venue", () => {
+    // The original attack, as a permanent regression test.
+    let made = 0;
+    for (let i = 0; i + 8 <= seatIds.length; i += 8) {
+      try {
+        service.holdSeats({ eventId, seatIds: seatIds.slice(i, i + 8), userId: "scalper" }, T0);
+        made += 1;
+      } catch {
+        break;
+      }
+    }
+
+    assert.equal(made, 1, "a single user should get one basket, not the whole venue");
+    assert.equal(getSeatMap(eventId, T0).summary.available, 16);
+
+    // And a real customer can still buy.
+    const ok = service.holdSeats({ eventId, seatIds: [seatIds[20]], userId: "customer" }, T0);
+    assert.equal(ok.seatIds.length, 1);
+  });
+
+  test("the cap is per event, not global", () => {
+    seedTestEvent({ eventId: "evt-other", seatCount: 10 });
+
+    service.holdSeats({ eventId, seatIds: seatIds.slice(0, 8), userId: "alice" }, T0);
+
+    // Full up on the first event, but the second is untouched.
+    const other = service.holdSeats(
+      { eventId: "evt-other", seatIds: ["evt-other:A1", "evt-other:A2"], userId: "alice" },
+      T0,
+    );
+    assert.equal(other.seatIds.length, 2);
+  });
+
+  test("an expired hold returns the allowance", () => {
+    service.holdSeats({ eventId, seatIds: seatIds.slice(0, 8), userId: "alice", ttlMs: MINUTE }, T0);
+
+    const later = T0 + 2 * MINUTE;
+    const again = service.holdSeats({ eventId, seatIds: seatIds.slice(8, 16), userId: "alice" }, later);
+    assert.equal(again.seatIds.length, 8);
+  });
+
+  test("releasing returns the allowance immediately", () => {
+    const hold = service.holdSeats({ eventId, seatIds: seatIds.slice(0, 8), userId: "alice" }, T0);
+
+    assertFails(
+      () => service.holdSeats({ eventId, seatIds: [seatIds[8]], userId: "alice" }, T0),
+      { status: 409, code: "USER_HOLD_LIMIT_EXCEEDED" },
+    );
+
+    service.releaseHold({ holdId: hold.id, userId: "alice" });
+    assert.equal(service.holdSeats({ eventId, seatIds: [seatIds[8]], userId: "alice" }, T0).seatIds.length, 1);
+  });
+
+  test("confirmed seats do not count — the cap is the basket, not the purchase", () => {
+    const hold = service.holdSeats({ eventId, seatIds: seatIds.slice(0, 8), userId: "alice" }, T0);
+    service.confirmBooking({ holdId: hold.id, userId: "alice" }, T0);
+
+    // Having bought 8, alice may start a new basket.
+    const next = service.holdSeats({ eventId, seatIds: seatIds.slice(8, 16), userId: "alice" }, T0);
+    assert.equal(next.seatIds.length, 8);
+  });
+
+  test("one user's holds do not consume another user's allowance", () => {
+    service.holdSeats({ eventId, seatIds: seatIds.slice(0, 8), userId: "alice" }, T0);
+    const bob = service.holdSeats({ eventId, seatIds: seatIds.slice(8, 16), userId: "bob" }, T0);
+    assert.equal(bob.seatIds.length, 8);
   });
 });
 
