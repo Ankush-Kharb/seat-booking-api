@@ -71,6 +71,21 @@ transaction with row locks, or `UPDATE ... WHERE hold_id IS NULL`.
 
 ---
 
+## Deployment
+
+Deployed on Render from `render.yaml` — build `npm ci --omit=dev`, start `npm start`,
+health check on `/health`. Keeping it as a blueprint rather than dashboard settings
+means the deploy config is reviewable in version control.
+
+Two things to expect on the free tier, both consequences of the demo design rather
+than bugs:
+
+- **The first request after ~15 minutes of inactivity takes 30–60s.** The instance
+  spins down when idle and cold-starts on the next request.
+- **State resets on every restart.** The store is in memory, so seats return to
+  fully available whenever the instance restarts or redeploys. That is intentional
+  for a demo; the persistence path is described under *What production would change*.
+
 ## Run it
 
 ```bash

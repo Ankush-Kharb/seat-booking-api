@@ -1,0 +1,21 @@
+# Render blueprint. Deploying from this file rather than the dashboard keeps the
+# configuration in version control, so the deploy is reproducible and reviewable.
+services:
+  - type: web
+    name: seat-booking-api
+    runtime: node
+    plan: free
+    region: oregon
+
+    # --omit=dev skips supertest and its 16 packages: 65 packages instead of 81.
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+
+    # Render polls this and will not route traffic to an instance that fails it.
+    healthCheckPath: /health
+
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
