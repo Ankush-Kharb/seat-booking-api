@@ -3,7 +3,7 @@
 A ticketing API built around the one problem that makes seat booking hard: **two people
 must never buy the same seat**, even when they click at the same instant.
 
-Node 24 · Express 5 · zero runtime dependencies beyond Express · 39 tests, no test framework installed.
+Node 24 · Express 5 · Postgres 16 · two runtime dependencies · 51 tests, no test framework installed.
 
 ---
 
@@ -41,9 +41,9 @@ return AVAILABLE;
 
 The consequence is that **expiry needs nothing to run**. A hold that lapses at 14:02
 stops being reported at 14:02 whether or not any cleanup job fired. A background
-sweeper does exist, but it only reclaims memory and tidies the `status` field — kill it
-and the API is still correct. A stored-status design has the opposite property: every
-missed job is a seat locked forever.
+sweeper does exist, but all it does is tidy the `status` column and detach rows nobody
+will look at again — kill it and the API is still correct. A stored-status design has the
+opposite property: every missed job is a seat locked forever.
 
 **2. The service layer never calls `Date.now()`.**
 Time is a parameter. `Date.now()` is called in exactly one place per request — the
@@ -57,17 +57,39 @@ assert.equal(statusOf(seat, T0 + 59_000), "held");
 assert.equal(statusOf(seat, T0 + 61_000), "available");   // no waiting, no fake timers
 ```
 
-**3. Check and commit are separate phases, with no `await` between them.**
+**3. Check and commit are separate phases, inside one transaction.**
 `holdSeats` decides against every requested seat before it mutates anything, which is
-what makes a partial conflict hold *nothing*. Node runs one line of JavaScript at a
-time, so a synchronous function completes before another request is touched — the
-check-then-commit sequence is atomic here. Twenty simultaneous requests for one seat
-produce exactly one 201 and nineteen clean 409s, and there is a test that fires all
-twenty to prove it.
+what makes a partial conflict hold *nothing*. The seats are read `FOR UPDATE`, so no
+other transaction can read-then-write them until this one commits. Twenty simultaneous
+requests for one seat produce exactly one 201 and nineteen clean 409s, and there is a
+test that fires all twenty to prove it.
 
-That guarantee is a property of this in-memory design, not a general truth, and it ends
-the moment anything in that block awaits. Against a real database the equivalent is a
-transaction with row locks, or `UPDATE ... WHERE hold_id IS NULL`.
+A row lock is not enough on its own. The per-user seat cap reads the user's *other*
+holds, which are different rows covering different seats — so two requests from one
+user for disjoint seats take no common lock, and both would pass a cap they jointly
+break. That one is held by a `pg_advisory_xact_lock` on `(userId, eventId)`: a lock on
+a number rather than a row, because the contended resource — this user's allowance — is
+not a row. It is taken before any seat lock, so lock ordering is the same everywhere.
+
+## Schema
+
+Five tables, in `migrations/001_init.sql`. Two modelling decisions carry their weight:
+
+**`hold_seats` exists because ownership and intent are different facts.** `seats.hold_id`
+says which seats a hold *currently owns*, and it is cleared the moment the hold is
+released. `hold_seats` says which seats it *asked for*, and is never deleted. Deriving
+one from the other looks tempting and quietly breaks the API: releasing a hold returns
+that hold, `seatIds` and all, and a released hold owns nothing. Bookings need no
+equivalent table, because `seats.booking_id` is never cleared — sold is permanent.
+
+**`bookings.hold_id` is `UNIQUE`, and that is the idempotency guarantee.** The in-memory
+version kept a `holdId → bookingId` index, which made a duplicate confirm cheap to
+*detect*. A constraint makes it impossible to *write*: two racing confirms both pass the
+check, and the database refuses the second. The loser catches the unique violation and
+returns the booking the winner wrote.
+
+Seat status stays derived — there is no `status` column on `seats`, only the two nullable
+pointers — so there is nothing to fall out of step with them.
 
 ---
 
@@ -82,18 +104,30 @@ than bugs:
 
 - **The first request after ~15 minutes of inactivity takes 30–60s.** The instance
   spins down when idle and cold-starts on the next request.
-- **State resets on every restart.** The store is in memory, so seats return to
-  fully available whenever the instance restarts or redeploys. That is intentional
-  for a demo; the persistence path is described under *What production would change*.
+- **The first request also pays for a cold database connection.** The pool is empty
+  after a spin-down, so the first query opens a connection before it can run.
+
+State survives restarts: `render.yaml` provisions a free Postgres and injects
+`DATABASE_URL`, and `npm start` migrates before seeding anything missing.
 
 ## Run it
 
+Needs a Postgres. The compose file brings one up on port 5433, so it will not collide
+with anything already installed:
+
 ```bash
 npm install
+docker compose up -d
+export DATABASE_URL=postgres://postgres:postgres@localhost:5433/seatbooking
+
+npm run migrate           # apply migrations/*.sql
 npm start                 # http://localhost:3000, seeded with two events
-npm test                  # 39 tests
+npm test                  # 51 tests
 npm run dev               # restart on file change
 ```
+
+Tests run with `--test-concurrency=1`: the files share one database and `TRUNCATE`
+between cases, so running them in parallel would have them wipe each other's data.
 
 Then open **http://localhost:3000** for a browser console that drives every endpoint:
 click seats to hold them, watch the countdown, and hit *Race* to fire 20 simultaneous
@@ -168,19 +202,23 @@ Every error shares one shape, produced by a single middleware:
 ## Structure
 
 ```
+migrations/
+└── 001_init.sql       tables, constraints, indexes
+
 public/
 └── index.html         browser console — dependency-free, served at /
 
 src/
-├── server.js          entrypoint: seed, listen, sweeper, graceful shutdown
+├── server.js          entrypoint: migrate, seed, listen, sweeper, graceful shutdown
 ├── app.js             Express wiring and middleware order
-├── db.js              the in-memory Maps — the only file that owns storage
-├── seed.js            demo events
+├── db.js              the Postgres pool and withTransaction — the only file that owns storage
+├── migrate.js         applies migrations/*.sql, tracked in schema_migrations
+├── seed.js            demo events, inserted only if absent
 ├── models/            record factories, status enums, isHoldActive, seatStatus
 ├── routes/            URL → handler
 ├── controllers/       parse request, call service, send JSON. No try/catch anywhere
 ├── services/          ★ the rules. No Express, no Date.now()
-├── repositories/      data access + secondary-index maintenance. No rules
+├── repositories/      SQL. Every function takes an executor — the pool, or a transaction
 ├── middleware/        auth stand-in, error → HTTP mapping
 └── errors/            AppError carrying an HTTP status
 ```
@@ -191,7 +229,7 @@ No service imports Express; no repository knows what a hold means.
 ## Tests
 
 ```
-tests/booking.service.test.js   25 tests — rules, at a controlled clock
+tests/booking.service.test.js   37 tests — rules, at a controlled clock
 tests/api.test.js               14 tests — real HTTP, including the races
 ```
 
@@ -201,10 +239,15 @@ The ones that earn their keep:
 - **Two users with overlapping seat ranges** → one gets everything, the other nothing.
 - **The sweeper must not steal a re-held seat.** A lapsed hold is still marked `ACTIVE`
   until swept; if another user has since claimed the seat, sweeping the old hold must
-  leave it alone. The guard is `if (seat.holdId === hold.id)` — one line, and the
-  nastiest bug in the codebase without it.
+  leave it alone. The guard used to be `if (seat.holdId === hold.id)` inside a loop; it
+  is now the `WHERE hold_id = ANY(...)` of a single `UPDATE`, which cannot be got wrong
+  in the same way — but it is still the nastiest bug in the codebase without it.
 - **Confirm is idempotent** — a retried request returns the original booking rather
-  than charging twice.
+  than charging twice, and three *simultaneous* confirms of one hold still produce one
+  booking row.
+- **One user, three concurrent requests, four disjoint seats each** → 8 seats held, not
+  12. No two of those requests share a seat, so row locks alone would let all three
+  through; this is the test that fails if the advisory lock is ever removed.
 
 ## A bug the load testing found
 
@@ -221,9 +264,9 @@ real customer: 409 SEATS_UNAVAILABLE — entire venue locked by one user
 Twenty-five requests, no payment, whole venue locked — and renewable indefinitely by
 extending before each expiry.
 
-The fix is a second cap on *total seats held per user, per event*, enforced through a
-`userId -> Set<holdId>` index so the check costs O(that user's holds) rather than
-scanning every active hold in the system. Same attack now:
+The fix is a second cap on *total seats held per user, per event*, served by a partial
+index (`holds (user_id, event_id) WHERE status = 'active'`) so the check reads only that
+user's live holds rather than scanning every active hold in the system. Same attack now:
 
 ```
 scalper holds made: 1
@@ -239,30 +282,29 @@ regression test.
 
 ## Measured
 
-`npm run loadtest -- 100000 128` — 100,000 requests per scenario over a 128-connection
-pool, single process, in-memory store, on a laptop:
+`npm run loadtest -- 5000 64` — 5,000 requests per scenario, 64 concurrent clients
+against a 20-connection pool, with Postgres and the API on the same laptop:
 
 | Scenario | Throughput | p50 | p99 | Result |
 |---|---|---|---|---|
-| 100,000 holds, **all for one seat** | 14,712 req/s | 8.1ms | 14.2ms | **1 × 201, 99,999 × 409** |
-| 100,000 holds, one per distinct seat | 17,325 req/s | 7.0ms | 15.3ms | 100,000 × 201 |
-| 100,000 seat-map reads (200 seats each) | 5,517 req/s | 21.7ms | 59.2ms | 100,000 × 200 |
+| 5,000 holds, **all for one seat** | 3,079 req/s | 19.3ms | 45.0ms | **1 × 201, 4,999 × 409** |
+| 5,000 holds, one per distinct seat | 3,440 req/s | 18.2ms | 27.1ms | 5,000 × 201 |
+| 5,000 seat-map reads (200 seats each) | 1,063 req/s | 59.9ms | 73.8ms | 5,000 × 200 |
 
-31s wall clock. Zero 5xx, zero dropped requests, 359MB RSS holding 100,000 seats and
-100,000 holds.
-
-The first row is the one that matters: under a hundred thousand simultaneous attempts on
-a single seat, exactly one succeeded.
+Zero 5xx, zero dropped requests. The harness asserts the status distribution of every
+scenario and exits non-zero if one is wrong, so the first row is a checked claim rather
+than a printed one: five thousand simultaneous attempts on a single seat, exactly one
+succeeded.
 
 Three things the numbers do not say:
 
-- **Throughput improves with volume here.** The same contention scenario runs at
-  7,111 req/s over 10,000 requests and 14,712 req/s over 100,000, with p99 falling from
-  95ms to 14ms. That is V8's JIT compiling hot paths once they are hot enough. Short
-  benchmarks understate steady state; these figures are post-warmup.
-- **These are localhost numbers on one process with an in-memory store.** Add a database
-  and it dominates every figure here. Treat them as an upper bound that real persistence
-  will erode, not as a capacity estimate.
+- **This is roughly a fifth of what the in-memory version did** — the same contention
+  scenario ran at ~14,700 req/s against Maps. That is the honest price of durability: the
+  old figure measured a hash-map write, this one measures a row lock, a commit and a
+  socket round trip. Numbers that survive a restart are worth more than numbers that do not.
+- **`PG_POOL_MAX` is the knob, not CPU.** Requests beyond the pool size queue for a
+  connection, and that queue is most of what p99 measures here. Raising it past what the
+  database can actually serve relocates the contention rather than removing it.
 - **Fire all connections simultaneously instead of pooling them and you get
   ETIMEDOUT/ECONNRESET** — macOS caps the accept queue at `kern.ipc.somaxconn` (128 by
   default), so the kernel drops connections before Node sees them. That is a socket
@@ -271,12 +313,17 @@ Three things the numbers do not say:
 
 ## What production would change
 
-- **Storage.** Swap the four repositories for SQL; nothing above them changes. The
-  in-flight check would become a transaction or a conditional `UPDATE`.
 - **Auth.** `x-user-id` becomes a verified JWT. The rest is untouched — every ownership
   check already reads `req.userId`.
-- **Horizontal scaling.** Single-threaded atomicity is a single-process guarantee. Two
-  instances need the database, or Redis, to arbitrate.
+- **Migrations as a release step.** `npm start` migrates on boot, which keeps the deploy
+  to one command but lets a code rollback leave the schema ahead of the code. A larger
+  team runs migrations separately, before the new version starts.
+- **Connection budget.** Horizontal scaling is safe now — atomicity belongs to the
+  database, not to one process — but every instance brings its own pool, and
+  `instances × PG_POOL_MAX` must stay under the server's `max_connections`. That ceiling
+  arrives well before CPU does, and PgBouncer is the usual answer.
+- **Sweeper ownership.** Every instance currently runs its own sweeper. It is idempotent
+  so this is harmless, just wasteful; one owner elected via an advisory lock would do.
 - **Payments.** Confirm currently costs nothing. A real flow would hold seats across a
   payment authorisation, with the TTL sized to the payment provider's timeout.
 - **Observability.** Structured request logs, and a metric on hold-to-booking conversion.
