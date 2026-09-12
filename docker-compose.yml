@@ -1,0 +1,24 @@
+# Local Postgres for development and tests.
+#
+#   docker compose up -d
+#   export DATABASE_URL=postgres://postgres:postgres@localhost:5433/seatbooking
+#   npm run migrate
+#
+# Port 5433, not 5432, so this never collides with a Postgres already installed on
+# the host. tmpfs keeps the data in RAM: this is throwaway state, and tests that
+# TRUNCATE between cases run appreciably faster without hitting a disk.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: seatbooking
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

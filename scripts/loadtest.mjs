@@ -18,7 +18,13 @@
 
 import http from "node:http";
 import { createApp } from "../src/app.js";
-import { resetDb } from "../src/db.js";
+// Aliased: this file already has a `pool` of its own (the concurrency limiter below),
+// and two different pools under one name is a bug waiting to happen.
+import { pool as pgPool, closePool } from "../src/db.js";
+import { migrate } from "../src/migrate.js";
+// The test helpers already own the "wipe every table" statement; duplicating the
+// table list here is how the two drift apart the next time a table is added.
+import { resetDb } from "../tests/helpers.js";
 import * as eventRepo from "../src/repositories/event.repository.js";
 import * as seatRepo from "../src/repositories/seat.repository.js";
 import { createEvent, createSeat } from "../src/models/index.js";
@@ -75,19 +81,21 @@ const pool = async (count, limit, make) => {
 
 const percentile = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1)];
 
-const seed = (seatCount) => {
-  resetDb();
-  eventRepo.insert(createEvent({ id: EVENT_ID, name: "Load Test", venue: "Bench", startsAt: "2027-01-01T00:00:00.000Z" }));
-  const seatIds = [];
+const seed = async (seatCount) => {
+  await resetDb();
+  await eventRepo.insert(pgPool, createEvent({ id: EVENT_ID, name: "Load Test", venue: "Bench", startsAt: "2027-01-01T00:00:00.000Z" }));
+  const seats = [];
   for (let i = 1; i <= seatCount; i += 1) {
-    const id = `${EVENT_ID}:S${i}`;
-    seatRepo.insert(createSeat({ id, eventId: EVENT_ID, row: "S", number: i, tier: "standard", priceCents: 1000 }));
-    seatIds.push(id);
+    seats.push(createSeat({ id: `${EVENT_ID}:S${i}`, eventId: EVENT_ID, row: "S", number: i, tier: "standard", priceCents: 1000 }));
   }
-  return seatIds;
+  await seatRepo.insertMany(pgPool, seats);
+  return seats.map((seat) => seat.id);
 };
 
-const run = async (name, make, { expect } = {}) => {
+// `expect` is the status→count map the scenario must produce, passed positionally.
+// It used to be destructured as `{ expect } = {}` while every call site passed the
+// map directly, so it was always undefined and no scenario was ever actually checked.
+const run = async (name, make, expect) => {
   const started = process.hrtime.bigint();
   const results = CONCURRENCY > 0
     ? await pool(N, CONCURRENCY, make)
@@ -116,6 +124,8 @@ const run = async (name, make, { expect } = {}) => {
 };
 
 // ---------------------------------------------------------------------------
+await migrate();
+
 const app = createApp();
 const server = app.listen(0, "127.0.0.1", 2048); // backlog, capped by kern.ipc.somaxconn
 await new Promise((r) => server.once("listening", r));
@@ -124,7 +134,7 @@ const mode = CONCURRENCY > 0 ? `${CONCURRENCY} concurrent` : "all at once (unbou
 console.log(`Load test — ${N} requests per scenario, ${mode}, port ${port}\n${"─".repeat(64)}`);
 
 // 1. Maximum contention: every request wants the same seat.
-seed(10);
+await seed(10);
 await run(
   `1. CONTENTION — ${N} simultaneous holds, all for one seat`,
   () => hit(port, "POST", "/holds", { eventId: EVENT_ID, seatIds: [`${EVENT_ID}:S1`] }),
@@ -132,7 +142,7 @@ await run(
 );
 
 // 2. No contention: one request per seat, all at once.
-const seatIds = seed(N);
+const seatIds = await seed(N);
 await run(
   `2. THROUGHPUT — ${N} simultaneous holds, one per distinct seat`,
   (i) => hit(port, "POST", "/holds", { eventId: EVENT_ID, seatIds: [seatIds[i]] }),
@@ -143,7 +153,7 @@ await run(
 // measures request throughput rather than payload growth — every seat is held, so
 // each request does 200 hold lookups plus a 200-seat JSON serialisation.
 const READ_SEATS = 200;
-const readSeatIds = seed(READ_SEATS);
+const readSeatIds = await seed(READ_SEATS);
 for (const id of readSeatIds) {
   await hit(port, "POST", "/holds", { eventId: EVENT_ID, seatIds: [id] });
 }
@@ -156,7 +166,12 @@ await run(
 const mem = process.memoryUsage();
 console.log(`\n${"─".repeat(64)}`);
 console.log(`heap in use: ${(mem.heapUsed / 1024 / 1024).toFixed(1)} MB   rss: ${(mem.rss / 1024 / 1024).toFixed(1)} MB`);
-console.log(`(${N} seats, ${N} holds retained in memory)`);
+// The interesting number used to be heap, because every hold lived in a Map in this
+// process. State is in Postgres now, so this figure says little about the data and a
+// lot about how many requests are in flight. PG_POOL_MAX is the knob that matters:
+// requests beyond it queue for a connection, which is what shows up as p99 latency.
+console.log(`(pool max ${process.env.PG_POOL_MAX ?? 10}; state is in Postgres, not in this heap)`);
 
 server.close();
 agent.destroy();
+await closePool();

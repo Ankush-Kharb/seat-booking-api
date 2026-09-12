@@ -2,11 +2,12 @@
 // request, and shuts it down — so status codes, headers, and JSON shapes are all
 // exercised exactly as a client would meet them.
 
-import { test, describe, beforeEach } from "node:test";
+import { test, describe, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import request from "supertest";
 
 import { freshDb } from "./helpers.js";
+import { closePool } from "../src/db.js";
 import { createApp } from "../src/app.js";
 
 const app = createApp(); // stateless — the database is what gets reset between tests
@@ -14,9 +15,12 @@ const app = createApp(); // stateless — the database is what gets reset betwee
 let eventId;
 let seatIds;
 
-beforeEach(() => {
-  ({ eventId, seatIds } = freshDb({ seatCount: 5, priceCents: 1500 }));
+beforeEach(async () => {
+  ({ eventId, seatIds } = await freshDb({ seatCount: 5, priceCents: 1500 }));
 });
+
+// Without this the pool keeps a socket open and the test process never exits.
+after(() => closePool());
 
 const holdSeats = (userId, body) =>
   request(app).post("/holds").set("x-user-id", userId).send(body);
@@ -166,6 +170,10 @@ describe("the booking flow", () => {
 });
 
 describe("concurrency", () => {
+  // These two tests were nearly free against the Maps: a synchronous handler ran to
+  // completion before the next request was touched, so a race was not expressible.
+  // Against Postgres they are the real thing — 20 connections contending for one row
+  // — and they fail loudly if the FOR UPDATE in holdSeats is ever dropped.
   test("20 simultaneous requests for one seat produce exactly one hold", async () => {
     // Promise.all fires all 20 requests before awaiting any of them, so they are
     // genuinely in flight together and arrive interleaved at the server.

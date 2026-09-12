@@ -1,58 +1,65 @@
-// The in-memory database.
+// The Postgres connection pool and the transaction helper.
 //
-// This is the ONLY file that owns storage. Nothing above the repository layer is
-// allowed to import it. That restriction is what makes "swap in Postgres later" an
-// honest claim rather than a slogan: you would rewrite the four repositories and
-// delete this file, and no service, controller, or route would change.
+// Replaces src/db.js at cutover. The same rule carries over unchanged: this is the
+// only file that owns storage, and nothing above the repository layer may import it.
 //
-// `Map` rather than a plain object, because:
-//   - keys stay exactly what you put in (object keys are coerced to strings)
-//   - `.size` is O(1), and iteration order is insertion order
-//   - no accidental collisions with inherited properties like "constructor"
-// Lookup is O(1) either way.
+// What is new is the thing the Maps never needed — a connection. A Map lookup was a
+// pointer dereference. A query is a round trip over a socket, so every call becomes
+// async, and several requests are genuinely in flight at once. That concurrency is
+// the whole reason the check/commit split in booking.service.js stops being safe on
+// its own.
+
+import pg from "pg";
+
+const { Pool } = pg;
 
 /**
- * Secondary indexes exist so that no read has to scan a whole table.
+ * A pool, not a connection. Opening a Postgres connection is expensive (a process
+ * on the server side), so we keep a small fixed set and hand them out per query.
  *
- *   seatIdsByEvent  — GET /events/:id/seats would otherwise scan every seat
- *                     of every event to find the ones it wants.
- *   bookingIdByHold — makes confirm idempotent in O(1): "has this hold already
- *                     produced a booking?"
-  *   activeHoldIds   — the expiry sweeper walks only live holds instead of every
- *                     hold ever created, which otherwise grows without bound.
- *   activeHoldIdsByUser
- *                   — enforcing the per-user seat cap would otherwise mean scanning
- *                     every active hold in the system on every hold request. Under
- *                     load that is 100,000 holds scanned per request.
- *
- * The cost is that writes must keep the indexes in step with the primary maps.
- * That is exactly why writes are confined to the repositories.
+ * `max` is a real ceiling on concurrency: with max 10, an eleventh simultaneous
+ * request waits for a connection to come free. Setting it high does not make the
+ * database faster — it makes contention worse.
  */
-const emptyState = () => ({
-  events: new Map(),        // eventId   -> Event
-  seats: new Map(),         // seatId    -> Seat
-  holds: new Map(),         // holdId    -> Hold
-  bookings: new Map(),      // bookingId -> Booking
-
-  seatIdsByEvent: new Map(), // eventId -> string[]
-  bookingIdByHold: new Map(), // holdId -> bookingId
-  activeHoldIds: new Set(),   // holdIds currently ACTIVE (may still be expired)
-  activeHoldIdsByUser: new Map(), // userId -> Set<holdId>, ACTIVE only
+export const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: Number(process.env.PG_POOL_MAX ?? 10),
 });
 
-export const db = emptyState();
-
 /**
- * Wipe every table. Tests call this between cases so one test cannot leak state
- * into the next.
+ * Run `fn` inside one transaction, handing it the client to use.
  *
- * It mutates the existing `db` object rather than reassigning it, because every
- * other module already holds a reference to that object — reassigning the binding
- * here would leave them all pointing at the old, stale state.
+ * Every repository function takes an "executor" as its first argument. It is either
+ * `pool` — each query commits on its own — or the client passed here, in which case
+ * every query joins this transaction. Both expose `.query()`, so a repository
+ * function does not know or care which it got. That duck typing is standing in for
+ * what you would express in C++ as taking a reference to an abstract base.
+ *
+ * The `finally` is the important line, and it is exactly RAII: `release()` is the
+ * destructor that returns the connection to the pool. Miss it on an error path and
+ * you leak one connection per failed request, until `max` is reached and the whole
+ * app wedges waiting for a connection that is never coming back.
  */
-export const resetDb = () => {
-  const fresh = emptyState();
-  for (const key of Object.keys(fresh)) {
-    db[key] = fresh[key];
+export const withTransaction = async (fn) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    // ROLLBACK can itself throw if the connection died mid-transaction. Swallow that
+    // one, because the caller needs the original error, not the cleanup's.
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* the connection is gone; releasing it below is all that is left to do */
+    }
+    throw error;
+  } finally {
+    client.release();
   }
 };
+
+/** Close the pool. Tests and a clean shutdown need this or the process will not exit. */
+export const closePool = () => pool.end();

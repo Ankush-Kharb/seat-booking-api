@@ -7,16 +7,18 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test",
-    "test:watch": "node --test --watch",
-    "loadtest": "node scripts/loadtest.mjs"
+    "test": "node --test --test-concurrency=1",
+    "test:watch": "node --test --test-concurrency=1 --watch",
+    "loadtest": "node scripts/loadtest.mjs",
+    "migrate": "node src/migrate.js"
   },
   "engines": {
     "node": ">=22"
   },
   "license": "MIT",
   "dependencies": {
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "pg": "^8.23.0"
   },
   "devDependencies": {
     "supertest": "^7.2.2"
