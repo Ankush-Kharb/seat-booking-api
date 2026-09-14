@@ -1,8 +1,8 @@
 import * as bookingService from "../services/booking.service.js";
 import { toBookingResponse } from "./presenters.js";
 
-export const createBooking = (req, res) => {
-  const booking = bookingService.confirmBooking(
+export const createBooking = async (req, res) => {
+  const booking = await bookingService.confirmBooking(
     { holdId: req.body.holdId, userId: req.userId },
     Date.now(),
   );
@@ -11,8 +11,8 @@ export const createBooking = (req, res) => {
   res.status(201).json({ booking: toBookingResponse(booking) });
 };
 
-export const getBooking = (req, res) => {
-  const booking = bookingService.getBooking({
+export const getBooking = async (req, res) => {
+  const booking = await bookingService.getBooking({
     bookingId: req.params.bookingId,
     userId: req.userId,
   });

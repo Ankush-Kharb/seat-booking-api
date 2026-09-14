@@ -3,6 +3,7 @@
 // Seat ids are readable (`evt-1:A1`) rather than UUIDs purely so the examples in the
 // README can be copied and pasted. Real seats would use generated ids.
 
+import { pool } from "./db.js";
 import * as eventRepo from "./repositories/event.repository.js";
 import * as seatRepo from "./repositories/seat.repository.js";
 import { createEvent, createSeat } from "./models/index.js";
@@ -14,21 +15,29 @@ const TIERS = {
 };
 
 /** Build one event with `rows` × `seatsPerRow` seats. */
-const seedEvent = ({ id, name, venue, startsAt, rows, seatsPerRow }) => {
-  eventRepo.insert(createEvent({ id, name, venue, startsAt }));
+const seedEvent = async ({ id, name, venue, startsAt, rows, seatsPerRow }) => {
+  // The Maps started empty on every boot, so seeding was unconditional. A database
+  // does not, and inserting the same primary key twice is an error — so seeding
+  // becomes "only if absent".
+  if ((await eventRepo.findById(pool, id)) !== undefined) return;
 
+  await eventRepo.insert(pool, createEvent({ id, name, venue, startsAt }));
+
+  const seats = [];
   for (const row of rows) {
     const { tier, priceCents } = TIERS[row];
     for (let number = 1; number <= seatsPerRow; number += 1) {
-      seatRepo.insert(
+      seats.push(
         createSeat({ id: `${id}:${row}${number}`, eventId: id, row, number, tier, priceCents }),
       );
     }
   }
+  // One statement rather than one per seat — see insertMany.
+  await seatRepo.insertMany(pool, seats);
 };
 
-export const seed = () => {
-  seedEvent({
+export const seed = async () => {
+  await seedEvent({
     id: "evt-1",
     name: "Arctic Monkeys — Live",
     venue: "Wembley Arena",
@@ -37,7 +46,7 @@ export const seed = () => {
     seatsPerRow: 10,
   });
 
-  seedEvent({
+  await seedEvent({
     id: "evt-2",
     name: "Hamilton — Matinee",
     venue: "Victoria Palace Theatre",

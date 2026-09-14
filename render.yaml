@@ -1,5 +1,11 @@
 # Render blueprint. Deploying from this file rather than the dashboard keeps the
 # configuration in version control, so the deploy is reproducible and reviewable.
+databases:
+  - name: seat-booking-db
+    plan: free
+    region: oregon
+    postgresMajorVersion: "16"
+
 services:
   - type: web
     name: seat-booking-api
@@ -7,7 +13,7 @@ services:
     plan: free
     region: oregon
 
-    # --omit=dev skips supertest and its 16 packages: 65 packages instead of 81.
+    # --omit=dev skips supertest and its 16 packages.
     buildCommand: npm ci --omit=dev
     startCommand: npm start
 
@@ -19,3 +25,14 @@ services:
         value: "24"
       - key: NODE_ENV
         value: production
+
+      # Injected by Render from the database above — never written down here.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: seat-booking-db
+          property: connectionString
+
+      # Render's free Postgres allows a small number of connections, and one web
+      # instance must not try to claim them all.
+      - key: PG_POOL_MAX
+        value: "5"
